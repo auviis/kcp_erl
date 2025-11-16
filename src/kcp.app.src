@@ -1,0 +1,16 @@
+%% KCP Application Resource File
+{application, kcp,
+ [{description, "KCP - A Fast and Reliable ARQ Protocol for Erlang"},
+  {vsn, "1.0.0"},
+  {registered, [kcp_sup]},
+  {mod, {kcp_app, []}},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["MIT"]},
+  {links, [{"GitHub", "https://github.com/skywind3000/kcp"}]}
+ ]}.
