@@ -40,7 +40,7 @@
     port :: port(),
     owner :: pid(),
     output_callback :: function() | undefined,
-    pending_calls = #{} :: map(),
+    pending_calls = [] :: list(),
     buffer = <<>> :: binary()
 }).
 
@@ -152,67 +152,67 @@ init([Owner | _Opts]) ->
 handle_call({create, Conv}, From, State = #state{port = Port}) ->
     Data = <<Conv:32>>,
     send_command(Port, ?CMD_CREATE, Data),
-    {noreply, State#state{pending_calls = maps:put(From, create, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, create}]}};
 
 handle_call({release, Handle}, From, State = #state{port = Port}) ->
     Data = <<Handle:32>>,
     send_command(Port, ?CMD_RELEASE, Data),
-    {noreply, State#state{pending_calls = maps:put(From, release, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, release}]}};
 
 handle_call({send, Handle, Binary}, From, State = #state{port = Port}) ->
     Data = <<Handle:32, Binary/binary>>,
     send_command(Port, ?CMD_SEND, Data),
-    {noreply, State#state{pending_calls = maps:put(From, send, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, send}]}};
 
 handle_call({recv, Handle}, From, State = #state{port = Port}) ->
     Data = <<Handle:32>>,
     send_command(Port, ?CMD_RECV, Data),
-    {noreply, State#state{pending_calls = maps:put(From, recv, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, recv}]}};
 
 handle_call({update, Handle, Current}, From, State = #state{port = Port}) ->
     Data = <<Handle:32, Current:32>>,
     send_command(Port, ?CMD_UPDATE, Data),
-    {noreply, State#state{pending_calls = maps:put(From, update, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, update}]}};
 
 handle_call({flush, Handle}, From, State = #state{port = Port}) ->
     Data = <<Handle:32>>,
     send_command(Port, ?CMD_FLUSH, Data),
-    {noreply, State#state{pending_calls = maps:put(From, flush, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, flush}]}};
 
 handle_call({check, Handle, Current}, From, State = #state{port = Port}) ->
     Data = <<Handle:32, Current:32>>,
     send_command(Port, ?CMD_CHECK, Data),
-    {noreply, State#state{pending_calls = maps:put(From, check, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, check}]}};
 
 handle_call({input, Handle, Binary}, From, State = #state{port = Port}) ->
     Data = <<Handle:32, Binary/binary>>,
     send_command(Port, ?CMD_INPUT, Data),
-    {noreply, State#state{pending_calls = maps:put(From, input, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, input}]}};
 
 handle_call({nodelay, Handle, Nodelay, Interval, Resend, Nc}, From, State = #state{port = Port}) ->
     Data = <<Handle:32, Nodelay:32, Interval:32, Resend:32, Nc:32>>,
     send_command(Port, ?CMD_NODELAY, Data),
-    {noreply, State#state{pending_calls = maps:put(From, nodelay, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, nodelay}]}};
 
 handle_call({wndsize, Handle, SndWnd, RcvWnd}, From, State = #state{port = Port}) ->
     Data = <<Handle:32, SndWnd:32, RcvWnd:32>>,
     send_command(Port, ?CMD_WNDSIZE, Data),
-    {noreply, State#state{pending_calls = maps:put(From, wndsize, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, wndsize}]}};
 
 handle_call({setmtu, Handle, Mtu}, From, State = #state{port = Port}) ->
     Data = <<Handle:32, Mtu:32>>,
     send_command(Port, ?CMD_SETMTU, Data),
-    {noreply, State#state{pending_calls = maps:put(From, setmtu, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, setmtu}]}};
 
 handle_call({peeksize, Handle}, From, State = #state{port = Port}) ->
     Data = <<Handle:32>>,
     send_command(Port, ?CMD_PEEKSIZE, Data),
-    {noreply, State#state{pending_calls = maps:put(From, peeksize, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, peeksize}]}};
 
 handle_call({waitsnd, Handle}, From, State = #state{port = Port}) ->
     Data = <<Handle:32>>,
     send_command(Port, ?CMD_WAITSND, Data),
-    {noreply, State#state{pending_calls = maps:put(From, waitsnd, State#state.pending_calls)}};
+    {noreply, State#state{pending_calls = State#state.pending_calls ++ [{From, waitsnd}]}};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
@@ -271,11 +271,11 @@ send_command(Port, Cmd, Data) ->
     Packet = <<Cmd:8, Len:32, Data/binary>>,
     port_command(Port, Packet).
 
-reply_to_pending(Pending, Response) when map_size(Pending) > 0 ->
-    [{From, _Type}] = maps:to_list(Pending),
-    gen_server:reply(From, Response);
-reply_to_pending(_, _) ->
-    ok.
+reply_to_pending([{From, _Type} | Rest], Response) ->
+    gen_server:reply(From, Response),
+    Rest;
+reply_to_pending([], _Response) ->
+    [].
 
 parse_ok_response(<<>>) ->
     ok;
@@ -307,14 +307,14 @@ parse_responses(Data, Acc) ->
 process_responses([], State) ->
     State;
 process_responses([{error, ErrorMsg} | Rest], State = #state{pending_calls = Pending}) ->
-    reply_to_pending(Pending, {error, list_to_atom(ErrorMsg)}),
-    process_responses(Rest, State#state{pending_calls = #{}});
+    NewPending = reply_to_pending(Pending, {error, list_to_atom(ErrorMsg)}),
+    process_responses(Rest, State#state{pending_calls = NewPending});
 process_responses([{output, Conv, Data} | Rest], State = #state{owner = Owner}) ->
     Owner ! {kcp_output, Conv, Data},
     process_responses(Rest, State);
 process_responses([{ok, Payload} | Rest], State = #state{pending_calls = Pending}) ->
     Response = parse_ok_response(Payload),
-    reply_to_pending(Pending, Response),
-    process_responses(Rest, State#state{pending_calls = #{}});
+    NewPending = reply_to_pending(Pending, Response),
+    process_responses(Rest, State#state{pending_calls = NewPending});
 process_responses([_ | Rest], State) ->
     process_responses(Rest, State).

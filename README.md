@@ -100,6 +100,12 @@ end.
 ### Complete Example
 
 See `examples/kcp_echo_server.erl` for a complete UDP echo server implementation.
+- compile:
+    - erlc -I include -o ebin examples/kcp_echo_server.erl
+    - erlc -I include -o ebin examples/kcp_echo_client.erl
+- run:
+    - erl -pa ebin -pa _build/default/lib/kcp/ebin -noshell -eval 'application:ensure_all_started(kcp), kcp_echo_server:start(9102), io:format("KCP echo server started on 9102~n"), timer:sleep(infinity).'
+    - erl -pa ebin -pa _build/default/lib/kcp/ebin -noshell -eval 'application:ensure_all_started(kcp), C = kcp_echo_client:start({127,0,0,1}, 9102, 12345), kcp_echo_client:send(<<"Hello from client">>), timer:sleep(2000), kcp_echo_client:stop(), io:format("Client done~n"), init:stop().'
 
 ## API Reference
 

@@ -25,7 +25,7 @@
 -record(state, {
     socket :: gen_udp:socket(),
     kcp_server :: pid(),
-    sessions = #{} :: map(),      % {IP, Port} => {Handle, Conv, LastActivity}
+    sessions = #{} :: map(),      % {IP, Port} => {HandleOrUndefined, Conv, LastActivity, WorkerPid}
     conv_to_key = #{} :: map(),   % Conv => {IP, Port}
     monitors = #{} :: map()       % {IP, Port} => MonitorRef (for future use)
 }).
@@ -74,6 +74,7 @@ init([Port]) ->
             %% Schedule periodic tasks
             schedule_update(),
             schedule_timeout_check(),
+            schedule_hello_send(),
             
             {ok, #state{
                 socket = Socket,
@@ -90,14 +91,9 @@ init([Port]) ->
 handle_call({send_message, IP, Port, Message}, _From, State) ->
     Key = {IP, Port},
     case maps:get(Key, State#state.sessions, undefined) of
-        {Handle, _Conv, _LastActivity} ->
-            case kcp:send(Handle, Message) of
-                ok ->
-                    self() ! {flush_kcp, Handle},
-                    {reply, ok, State};
-                {error, Reason} ->
-                    {reply, {error, Reason}, State}
-            end;
+        {_HandleOrUndef, _Conv, _LastActivity, Pid} when is_pid(Pid) ->
+            Pid ! {send, Message},
+            {reply, ok, State};
         undefined ->
             {reply, {error, no_session}, State}
     end;
@@ -111,23 +107,31 @@ handle_cast(_Msg, State) ->
 
 %% @private
 handle_info({udp, Socket, IP, Port, Data}, State = #state{socket = Socket}) ->
-    NewState = handle_udp(IP, Port, Data, State),
+    NewState = handle_udp(Socket, IP, Port, Data, State),
     {noreply, NewState};
 
-handle_info({kcp_output, Conv, OutputData}, State = #state{socket = Socket}) ->
-    case maps:get(Conv, State#state.conv_to_key, undefined) of
+%% Session worker reported activity; update last-activity timestamp
+handle_info({session_activity, Conv}, State = #state{conv_to_key = ConvMap, sessions = Sessions}) ->
+    case maps:get(Conv, ConvMap, undefined) of
         {IP, Port} ->
-            gen_udp:send(Socket, IP, Port, OutputData),
-            io:format("Sent ~p bytes to ~p:~p (Conv: ~p)~n", 
-                     [byte_size(OutputData), IP, Port, Conv]),
-            {noreply, State};
+            Key = {IP, Port},
+            case maps:get(Key, Sessions, undefined) of
+                {Handle, Conv, _OldActivity, Pid} ->
+                    Now = erlang:monotonic_time(millisecond),
+                    NewSessions = maps:put(Key, {Handle, Conv, Now, Pid}, Sessions),
+                    {noreply, State#state{sessions = NewSessions}};
+                _ ->
+                    {noreply, State}
+            end;
         undefined ->
-            io:format("Warning: Output for unknown conv ~p~n", [Conv]),
             {noreply, State}
     end;
 
-handle_info({flush_kcp, Handle}, State) ->
-    kcp:flush(Handle),
+%% NOTE: when workers own KCP handles they will receive {kcp_output,...}
+%% and send UDP themselves. Server no longer handles kcp_output.
+
+handle_info({flush_kcp, _Handle}, State) ->
+    %% Workers flush their own handles; ignore server-side flush requests
     {noreply, State};
 
 handle_info(update_kcp, State) ->
@@ -141,16 +145,56 @@ handle_info(check_timeouts, State) ->
     schedule_timeout_check(),
     {noreply, State2};
 
+handle_info(send_hello, State) ->
+    %% Send scheduled "hello" to all active sessions (workers will handle kcp send)
+    NewState = send_hello_to_all(State),
+    schedule_hello_send(),
+    {noreply, NewState};
+
+%% Worker exit notification: remove session and conv mapping
+handle_info({worker_exit, Conv}, State = #state{conv_to_key = ConvMap, sessions = Sessions}) ->
+    case maps:get(Conv, ConvMap, undefined) of
+        {IP, Port} ->
+            Key = {IP, Port},
+            NewSessions = maps:remove(Key, Sessions),
+            NewConv = maps:remove(Conv, ConvMap),
+            {noreply, State#state{sessions = NewSessions, conv_to_key = NewConv}};
+        undefined ->
+            {noreply, State}
+    end;
+
+%% Monitor down for worker processes: cleanup corresponding session
+handle_info({'DOWN', Ref, process, _Pid, _Reason}, State = #state{monitors = Monitors, sessions = Sessions, conv_to_key = ConvMap}) ->
+    case lists:keyfind(Ref, 2, maps:to_list(Monitors)) of
+        {Key, _} ->
+            case maps:get(Key, Sessions, undefined) of
+                {_, Conv, _LastActivity, _} ->
+                    NewSessions = maps:remove(Key, Sessions),
+                    NewConv = maps:remove(Conv, ConvMap),
+                    NewMonitors = maps:remove(Key, Monitors),
+                    {noreply, State#state{sessions = NewSessions, conv_to_key = NewConv, monitors = NewMonitors}};
+                _ -> {noreply, State}
+            end;
+        false -> {noreply, State}
+    end;
+
 handle_info(_Info, State) ->
     io:format("Warning: Unknown message: ~p~n", [_Info]),
     {noreply, State}.
 
 %% @private
 terminate(_Reason, #state{socket = Socket, sessions = Sessions}) ->
-    %% Release all KCP instances
+    %% Stop worker processes and release any server-owned handles (if present)
     maps:fold(
-        fun(_Key, {Handle, _Conv, _LastActivity}, Acc) ->
-            kcp:release(Handle),
+        fun(_Key, {HandleOrUndef, _Conv, _LastActivity, Pid}, Acc) ->
+            case is_pid(Pid) of
+                true -> Pid ! stop;
+                false -> ok
+            end,
+            case HandleOrUndef of
+                undefined -> ok;
+                _ -> catch kcp:release(HandleOrUndef)
+            end,
             Acc
         end,
         ok,
@@ -168,89 +212,121 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-handle_udp(IP, Port, Data, State = #state{sessions = Sessions}) ->
+handle_udp(Socket, IP, Port, Data, State = #state{sessions = Sessions}) ->
     Key = {IP, Port},
-    
+
     case maps:get(Key, Sessions, undefined) of
         undefined ->
             %% New session - extract Conv from the KCP packet
             case extract_conv(Data) of
                 {ok, Conv} ->
-                    {ok, Handle} = kcp:create(Conv),
-                    
-                    %% Configure KCP for fast mode with dead link detection
-                    ok = kcp:nodelay(Handle, 1, 10, 2, 1),
-                    ok = kcp:wndsize(Handle, 128, 128),
-                    ok = kcp:setmtu(Handle, 1400),
-                    
-                    io:format("New session from ~p:~p (Conv: ~p, Handle: ~p)~n", 
-                             [IP, Port, Conv, Handle]),
-                    
-                    %% Process the data
-                    case kcp:input(Handle, Data) of
-                        ok ->
-                            process_kcp_recv(Handle, IP, Port),
-                            %% Store session with timestamp
-                            Now = erlang:monotonic_time(millisecond),
-                            NewSessions = maps:put(Key, {Handle, Conv, Now}, Sessions),
-                            NewConvMap = maps:put(Conv, Key, State#state.conv_to_key),
-                            State#state{sessions = NewSessions, conv_to_key = NewConvMap};
-                        {error, Reason} ->
-                            io:format("Warning: Failed to input data for new session ~p:~p - ~p~n", 
-                                     [IP, Port, Reason]),
-                            kcp:release(Handle),
-                            State
-                    end;
+                    io:format("New session from ~p:~p (Conv: ~p)~n", [IP, Port, Conv]),
+
+                    %% Spawn a dedicated worker to handle this session; worker will create its own handle
+                    Worker = spawn(fun() -> session_worker_init(Conv, Data, IP, Port, Socket, self()) end),
+                    Ref = erlang:monitor(process, Worker),
+
+                    %% Store session with timestamp and worker pid (handle is owned by worker)
+                    Now = erlang:monotonic_time(millisecond),
+                    NewSessions = maps:put(Key, {undefined, Conv, Now, Worker}, Sessions),
+                    NewConvMap = maps:put(Conv, Key, State#state.conv_to_key),
+                    NewMonitors = maps:put(Key, Ref, State#state.monitors),
+                    State#state{sessions = NewSessions, conv_to_key = NewConvMap, monitors = NewMonitors};
                 {error, invalid_packet} ->
                     io:format("Warning: Received invalid KCP packet from ~p:~p~n", [IP, Port]),
                     State
             end;
-        
-        {Handle, Conv, _LastActivity} ->
-            %% Existing session - input data to KCP
-            case kcp:input(Handle, Data) of
-                ok ->
-                    process_kcp_recv(Handle, IP, Port),
-                    %% Update last activity timestamp
-                    Now = erlang:monotonic_time(millisecond),
-                    NewSessions = maps:put(Key, {Handle, Conv, Now}, Sessions),
-                    State#state{sessions = NewSessions};
-                {error, Reason} ->
-                    io:format("Warning: Failed to input data for ~p:~p - ~p~n", 
-                             [IP, Port, Reason]),
-                    State
-            end
+
+        {_HandleOrUndef, Conv, _LastActivity, Worker} ->
+            %% Existing session - forward raw UDP data to worker
+            Worker ! {input, Data, IP, Port},
+            %% Update last activity timestamp
+            Now = erlang:monotonic_time(millisecond),
+            NewSessions = maps:put(Key, {undefined, Conv, Now, Worker}, Sessions),
+            State#state{sessions = NewSessions}
+    end.
+ 
+
+%% Worker that handles a single session: receives forwarded UDP packets,
+%% inputs them into KCP, drains received messages and echoes them back.
+session_worker_init(Conv, FirstData, IP, Port, Socket, ServerPid) ->
+    %% Create KCP handle in worker process (handles are process-local in this kcp lib)
+    case kcp:create(Conv) of
+        {ok, Handle} ->
+            ok = kcp:nodelay(Handle, 1, 10, 2, 1),
+            ok = kcp:wndsize(Handle, 128, 128),
+            ok = kcp:setmtu(Handle, 1400),
+            %% If there is initial data, input it
+            (case FirstData of
+                 undefined -> ok;
+                 _ -> (case kcp:input(Handle, FirstData) of ok -> ok; {error, R} -> io:format("Worker input error init: ~p~n", [R]) end)
+            end),
+            %% Drain any immediate application data
+            drain_recv(Handle, IP, Port, ServerPid, Socket, Conv),
+            session_worker_loop(Handle, Conv, Socket, IP, Port, ServerPid);
+        {error, Reason} ->
+            io:format("Worker failed to create handle for conv ~p - ~p~n", [Conv, Reason]),
+            ServerPid ! {worker_exit, Conv},
+            exit(Reason)
     end.
 
-process_kcp_recv(Handle, IP, Port) ->
+session_worker_loop(Handle, Conv, Socket, IP, Port, ServerPid) ->
+    receive
+        {input, Data, _IP, _Port} ->
+            case kcp:input(Handle, Data) of
+                ok ->
+                    drain_recv(Handle, IP, Port, ServerPid, Socket, Conv),
+                    ServerPid ! {session_activity, Conv},
+                    session_worker_loop(Handle, Conv, Socket, IP, Port, ServerPid);
+                {error, Reason} ->
+                    io:format("Worker: kcp:input error for conv ~p - ~p~n", [Conv, Reason]),
+                    session_worker_loop(Handle, Conv, Socket, IP, Port, ServerPid)
+            end;
+        {send, Msg} when is_binary(Msg) ->
+            case kcp:send(Handle, Msg) of
+                ok -> kcp:flush(Handle);
+                {error, R} -> io:format("Worker: send error ~p~n", [R])
+            end,
+            session_worker_loop(Handle, Conv, Socket, IP, Port, ServerPid);
+        {kcp_output, _Conv, OutputData} ->
+            gen_udp:send(Socket, IP, Port, OutputData),
+            io:format("Worker sent ~p bytes to ~p:~p (Conv: ~p)~n", [byte_size(OutputData), IP, Port, Conv]),
+            session_worker_loop(Handle, Conv, Socket, IP, Port, ServerPid);
+        stop ->
+            kcp:release(Handle),
+            ServerPid ! {worker_exit, Conv},
+            ok
+    after 10 ->
+        %% Periodic update and dead-link check
+        Current = erlang:system_time(millisecond) band 16#FFFFFFFF,
+        catch kcp:update(Handle, Current),
+        case catch kcp:waitsnd(Handle) of
+            {ok, WaitSnd} when is_integer(WaitSnd), WaitSnd > ?DEAD_LINK_THRESHOLD ->
+                io:format("Worker: Dead link for conv ~p, queue=~p~n", [Conv, WaitSnd]),
+                kcp:release(Handle),
+                ServerPid ! {worker_exit, Conv},
+                exit(dead_link);
+            _ -> ok
+        end,
+        session_worker_loop(Handle, Conv, Socket, IP, Port, ServerPid)
+    end.
+
+drain_recv(Handle, IP, Port, ServerPid, Socket, Conv) ->
     case kcp:recv(Handle) of
         {ok, RecvData} ->
-            io:format("Received from ~p:~p: ~p~n", [IP, Port, RecvData]),
-            %% Echo back
+            io:format("Worker Received from ~p:~p: ~p~n", [IP, Port, RecvData]),
             case kcp:send(Handle, RecvData) of
-                ok ->
-                    io:format("Queued echo for ~p:~p (~p bytes)~n", [IP, Port, byte_size(RecvData)]),
-                    self() ! {flush_kcp, Handle};
-                {error, SendErr} ->
-                    io:format("Warning: Failed to queue echo: ~p~n", [SendErr])
+                ok -> kcp:flush(Handle);
+                {error, Reason} -> io:format("Worker: Failed to queue echo: ~p~n", [Reason])
             end,
-            %% Check for more data
-            process_kcp_recv(Handle, IP, Port);
+            drain_recv(Handle, IP, Port, ServerPid, Socket, Conv);
         {error, no_data} ->
             ok
     end.
 
-update_all_sessions(State = #state{sessions = Sessions}) ->
-    Current = erlang:system_time(millisecond) band 16#FFFFFFFF,
-    
-    maps:fold(
-        fun(_Key, {Handle, _Conv, _LastActivity}, Acc) ->
-            kcp:update(Handle, Current),
-            Acc
-        end,
-        State,
-        Sessions
-    ).
+update_all_sessions(State = #state{sessions = _Sessions}) ->
+    %% Workers own handles and perform their own updates; server no-op here
+    State.
 
 schedule_update() ->
     erlang:send_after(10, self(), update_kcp).
@@ -258,21 +334,43 @@ schedule_update() ->
 schedule_timeout_check() ->
     erlang:send_after(5000, self(), check_timeouts).
 
+%% Schedule hello every 10 seconds
+schedule_hello_send() ->
+    erlang:send_after(10000, self(), send_hello).
+
+%% Send "hello" to all active sessions
+send_hello_to_all(State = #state{sessions = Sessions}) ->
+    maps:fold(
+        fun({IP, Port}, {_Handle, _Conv, _LastActivity, Pid}, Acc) ->
+            case is_pid(Pid) of
+                true ->
+                    Pid ! {send, <<"hello">>},
+                    io:format("Scheduled hello to ~p:~p (worker)~n", [IP, Port]),
+                    Acc;
+                false ->
+                    Acc
+            end
+        end,
+        State,
+        Sessions
+    ).
+
 cleanup_inactive_sessions(State = #state{sessions = Sessions, conv_to_key = ConvToKey}) ->
     Now = erlang:monotonic_time(millisecond),
     
     {NewSessions, NewConvToKey} = maps:fold(
-        fun(Key, {Handle, Conv, LastActivity}, {AccSessions, AccConvToKey}) ->
+        fun(Key, {Handle, Conv, LastActivity, Pid}, {AccSessions, AccConvToKey}) ->
             Age = Now - LastActivity,
             if
                 Age > ?SESSION_TIMEOUT ->
                     {IP, Port} = Key,
                     io:format("Session timeout: ~p:~p (Conv: ~p, inactive for ~p ms)~n",
                              [IP, Port, Conv, Age]),
-                    kcp:release(Handle),
+                    %% Let worker release its handle; ask it to stop instead of killing it
+                    (case is_pid(Pid) of true -> Pid ! stop; false -> ok end),
                     {AccSessions, maps:remove(Conv, AccConvToKey)};
                 true ->
-                    {maps:put(Key, {Handle, Conv, LastActivity}, AccSessions),
+                    {maps:put(Key, {Handle, Conv, LastActivity, Pid}, AccSessions),
                      AccConvToKey}
             end
         end,
@@ -285,31 +383,34 @@ cleanup_inactive_sessions(State = #state{sessions = Sessions, conv_to_key = Conv
 %% Check for dead links by examining send queue buildup
 check_dead_links(State = #state{sessions = Sessions, conv_to_key = ConvToKey}) ->
     {NewSessions, NewConvToKey} = maps:fold(
-        fun(Key, {Handle, Conv, LastActivity}, {AccSessions, AccConvToKey}) ->
-            case kcp:waitsnd(Handle) of
-                {ok, WaitSnd} when WaitSnd > ?DEAD_LINK_THRESHOLD ->
-                    %% Send queue is building up, likely a dead connection
-                    {IP, Port} = Key,
-                    io:format("Dead link detected: ~p:~p (Conv: ~p, queue: ~p packets)~n",
-                             [IP, Port, Conv, WaitSnd]),
-                    kcp:release(Handle),
-                    {AccSessions, maps:remove(Conv, AccConvToKey)};
-                {ok, _} ->
-                    %% Connection healthy
-                    {maps:put(Key, {Handle, Conv, LastActivity}, AccSessions),
-                     AccConvToKey};
-                {error, _} ->
-                    %% Handle invalid, remove session
-                    {IP, Port} = Key,
-                    io:format("Invalid handle for ~p:~p (Conv: ~p), removing session~n",
-                             [IP, Port, Conv]),
-                    {AccSessions, maps:remove(Conv, AccConvToKey)}
+        fun(Key, {Handle, Conv, LastActivity, Pid}, {AccSessions, AccConvToKey}) ->
+            case Handle of
+                undefined ->
+                    %% Worker owns handle; rely on worker health/notifications
+                    {maps:put(Key, {Handle, Conv, LastActivity, Pid}, AccSessions), AccConvToKey};
+                _ ->
+                    case catch kcp:waitsnd(Handle) of
+                        {ok, WaitSnd} when WaitSnd > ?DEAD_LINK_THRESHOLD ->
+                            {IP, Port} = Key,
+                            io:format("Dead link detected: ~p:~p (Conv: ~p, queue: ~p packets)~n",
+                                     [IP, Port, Conv, WaitSnd]),
+                            (case is_pid(Pid) of true -> Pid ! stop; false -> ok end),
+                            {AccSessions, maps:remove(Conv, AccConvToKey)};
+                        {ok, _} ->
+                            {maps:put(Key, {Handle, Conv, LastActivity, Pid}, AccSessions), AccConvToKey};
+                        _ ->
+                            {IP, Port} = Key,
+                            io:format("Invalid handle for ~p:~p (Conv: ~p), removing session~n",
+                                     [IP, Port, Conv]),
+                            (case is_pid(Pid) of true -> Pid ! stop; false -> ok end),
+                            {AccSessions, maps:remove(Conv, AccConvToKey)}
+                    end
             end
         end,
         {#{}, ConvToKey},
         Sessions
     ),
-    
+
     State#state{sessions = NewSessions, conv_to_key = NewConvToKey}.
 
 %% Extract conversation ID from KCP packet
